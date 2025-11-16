@@ -1,9 +1,6 @@
 // server.js
 // Backend Cloock + PayPal Checkout (LIVE)
 
-// -----------------------------------------------------------------------------
-// IMPORTS
-// -----------------------------------------------------------------------------
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -12,29 +9,34 @@ const cors = require("cors");
 
 const app = express();
 
-// CORS **ouvert** pour que ton index en file:// ou autre puisse appeler l'API
-const corsOptions = {
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
-};
+// -----------------------------------------------------------------------------
+// CORS : on OUVRE tout (pour ton index en local ou ailleurs)
+// -----------------------------------------------------------------------------
+app.use(cors()); // autorise tout par défaut
 
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // préflight
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
 // CONFIG PAYPAL (LIVE)
 // -----------------------------------------------------------------------------
-// ⚠️ Sur Render, mets ces 2 vars :
-// PAYPAL_CLIENT_ID = ton client-id LIVE
+// Sur Render :
+// PAYPAL_CLIENT_ID     = ton client-id LIVE
 // PAYPAL_CLIENT_SECRET = ton secret LIVE
 
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 
-// On force le mode live comme tu veux
-const PAYPAL_API_BASE = "https://api-m.paypal.com";
+const PAYPAL_API_BASE = "https://api-m.paypal.com"; // LIVE
 
 // 3€ => 6000 pièces
 const COINS_PER_PURCHASE = 6000;
@@ -76,6 +78,11 @@ function addCoins(pseudo, amount) {
 // PAYPAL : access_token (live)
 // -----------------------------------------------------------------------------
 async function getAccessToken() {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+    console.error("❌ PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET manquants");
+    throw new Error("Config PayPal manquante");
+  }
+
   const credentials = Buffer.from(
     PAYPAL_CLIENT_ID + ":" + PAYPAL_CLIENT_SECRET
   ).toString("base64");
@@ -155,9 +162,7 @@ app.post("/api/create-order", async (req, res) => {
     );
 
     console.log("✅ create-order LIVE OK:", resp.data.id, "pseudo:", pseudo);
-
-    // Important : PayPal attend { id: "..." }
-    res.json({ id: resp.data.id });
+    res.json({ id: resp.data.id }); // PayPal attend { id: "..." }
   } catch (err) {
     console.error(
       "❌ Erreur create-order LIVE:",
