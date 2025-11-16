@@ -11,8 +11,17 @@ const axios = require("axios");
 const cors = require("cors");
 
 const app = express();
+
+// CORS **ouvert** pour que ton index en file:// ou autre puisse appeler l'API
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // préflight
 app.use(express.json());
-app.use(cors());
 
 // -----------------------------------------------------------------------------
 // CONFIG PAYPAL (LIVE)
