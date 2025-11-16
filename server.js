@@ -15,11 +15,9 @@ app.use(cors()); // autorise les requêtes depuis ton jeu web
 // CONFIG PAYPAL
 // -----------------------------------------------------------------------------
 // ⚠️ REMPLACE ces 2 valeurs par celles de TON appli PayPal (sandbox pour tester)
-const PAYPAL_CLIENT_ID = "AVLfw6qT49fViHsi5N4_FcFZPJsgoUv000X9GG0dxTb8FXWFTb_BZDsJ7563fNv-KqniwwzplUfr2mC-";
-const PAYPAL_CLIENT_SECRET = "EHDWirybXftybUe5--GTL0GlX54myv30Vjz04036Ek4iZHowOUlONYFyxHVwTo654YLS-i0_r7vNyRbt";
-
-// "sandbox" pour tester / "live" quand tu seras en prod
-const PAYPAL_MODE = "live";
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+const PAYPAL_MODE = process.env.PAYPAL_MODE || "sandbox";
 
 const PAYPAL_API_BASE =
   PAYPAL_MODE === "live"
