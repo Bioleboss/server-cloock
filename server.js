@@ -9,29 +9,30 @@ const cors = require("cors");
 
 const app = express();
 
-// CORS ouvert
-app.use(cors());
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// -----------------------------------------------------------------------------
+// CORS : ouvert pour que ton index.html (même en file://) puisse appeler l'API
+// -----------------------------------------------------------------------------
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+};
 
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
 // CONFIG PAYPAL (LIVE)
 // -----------------------------------------------------------------------------
-// Sur Render → variables d’environnement :
-// PAYPAL_CLIENT_ID     = ton client-id LIVE
-// PAYPAL_CLIENT_SECRET = ton secret LIVE
+// Sur Render :
+// PAYPAL_CLIENT_ID     = Live Client ID
+// PAYPAL_CLIENT_SECRET = Live Secret
 
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 
-// *** LIVE ***
+// LIVE
 const PAYPAL_API_BASE = "https://api-m.paypal.com";
 
 // 3€ => 6000 pièces
@@ -71,24 +72,25 @@ function addCoins(pseudo, amount) {
 }
 
 // -----------------------------------------------------------------------------
-// PAYPAL : access_token (LIVE)
+// PAYPAL : access_token (LIVE) - version "officielle" avec axios.auth
 // -----------------------------------------------------------------------------
 async function getAccessToken() {
   if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
-    console.error("❌ PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET manquants");
-    throw new Error("Config PayPal manquante");
+    throw new Error("Missing PAYPAL_CLIENT_ID or PAYPAL_CLIENT_SECRET");
   }
 
-  const credentials = Buffer.from(
-    PAYPAL_CLIENT_ID + ":" + PAYPAL_CLIENT_SECRET
-  ).toString("base64");
+  const params = new URLSearchParams();
+  params.append("grant_type", "client_credentials");
 
   const resp = await axios.post(
     `${PAYPAL_API_BASE}/v1/oauth2/token`,
-    "grant_type=client_credentials",
+    params.toString(),
     {
+      auth: {
+        username: PAYPAL_CLIENT_ID,
+        password: PAYPAL_CLIENT_SECRET,
+      },
       headers: {
-        Authorization: `Basic ${credentials}`,
         "Content-Type": "application/x-www-form-urlencoded",
       },
     }
@@ -101,29 +103,30 @@ async function getAccessToken() {
 // API
 // -----------------------------------------------------------------------------
 
-// ping
+// Healthcheck simple
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
-    paypalClient: PAYPAL_CLIENT_ID ? "ok" : "missing",
+    paypalClient: !!PAYPAL_CLIENT_ID,
+    paypalSecret: !!PAYPAL_CLIENT_SECRET,
     mode: "live",
   });
 });
 
-// récupérer les coins d'un joueur
-app.get("/api/player/:pseudo", (req, res) => {
-  const pseudo = req.params.pseudo;
-  const db = loadDb();
-  const coins = db[pseudo]?.coins || 0;
-  res.json({ pseudo, coins });
+// Debug: voir si les creds sont bien chargés (sans tout afficher)
+app.get("/api/debug-creds", (req, res) => {
+  res.json({
+    hasClient: !!PAYPAL_CLIENT_ID,
+    hasSecret: !!PAYPAL_CLIENT_SECRET,
+    clientStart: PAYPAL_CLIENT_ID ? PAYPAL_CLIENT_ID.slice(0, 10) : null,
+    clientLen: PAYPAL_CLIENT_ID ? PAYPAL_CLIENT_ID.length : 0,
+    secretLen: PAYPAL_CLIENT_SECRET ? PAYPAL_CLIENT_SECRET.length : 0,
+  });
 });
 
-// *** ROUTE DEBUG : permet de voir l’erreur PayPal directement dans le navigateur ***
+// Debug: tenter un create-order de test et renvoyer la réponse brute
 app.get("/api/debug-create-order", async (req, res) => {
   try {
-    const pseudo = "DEBUG_USER";
-    console.log("➡️ [DEBUG] create-order pour:", pseudo);
-
     const accessToken = await getAccessToken();
 
     const orderPayload = {
@@ -134,11 +137,11 @@ app.get("/api/debug-create-order", async (req, res) => {
             currency_code: "EUR",
             value: COINS_PRICE_EUR,
           },
-          custom_id: pseudo,
+          custom_id: "DEBUG_USER",
         },
       ],
       application_context: {
-        brand_name: "Cloock LIVE (DEBUG)",
+        brand_name: "Cloock DEBUG",
         shipping_preference: "NO_SHIPPING",
         user_action: "PAY_NOW",
       },
@@ -155,28 +158,29 @@ app.get("/api/debug-create-order", async (req, res) => {
       }
     );
 
-    console.log("✅ [DEBUG] create-order LIVE OK:", resp.data.id);
+    console.log("✅ [DEBUG] create-order OK:", resp.data.id);
     res.json({ ok: true, id: resp.data.id, raw: resp.data });
   } catch (err) {
+    const status = err?.response?.status || 500;
+    const data = err?.response?.data || err.message || err;
     console.error("❌ [DEBUG] Erreur create-order LIVE:");
-    if (err.response) {
-      console.error("Status:", err.response.status);
-      console.error("Data:", err.response.data);
-      return res.status(500).json({
-        ok: false,
-        error: "Erreur create-order LIVE",
-        status: err.response.status,
-        details: err.response.data,
-      });
-    } else {
-      console.error(err.message || err);
-      return res.status(500).json({
-        ok: false,
-        error: "Erreur create-order LIVE",
-        details: err.message || String(err),
-      });
-    }
+    console.error("Status:", status);
+    console.error("Data:", data);
+    res.status(200).json({
+      ok: false,
+      error: "Erreur create-order LIVE",
+      status,
+      details: data,
+    });
   }
+});
+
+// récupérer les coins d'un joueur
+app.get("/api/player/:pseudo", (req, res) => {
+  const pseudo = req.params.pseudo;
+  const db = loadDb();
+  const coins = db[pseudo]?.coins || 0;
+  res.json({ pseudo, coins });
 });
 
 // create-order : appelé par le bouton PayPal
@@ -186,8 +190,6 @@ app.post("/api/create-order", async (req, res) => {
     if (!pseudo || typeof pseudo !== "string") {
       return res.status(400).json({ error: "pseudo manquant" });
     }
-
-    console.log("➡️ create-order demandé pour:", pseudo);
 
     const accessToken = await getAccessToken();
 
@@ -223,34 +225,22 @@ app.post("/api/create-order", async (req, res) => {
     console.log("✅ create-order LIVE OK:", resp.data.id, "pseudo:", pseudo);
     res.json({ id: resp.data.id });
   } catch (err) {
-    console.error("❌ Erreur create-order LIVE:");
-    if (err.response) {
-      console.error("Status:", err.response.status);
-      console.error("Data:", err.response.data);
-      res.status(500).json({
-        error: "Erreur create-order LIVE",
-        status: err.response.status,
-        details: err.response.data,
-      });
-    } else {
-      console.error(err.message || err);
-      res.status(500).json({
-        error: "Erreur create-order LIVE",
-        details: err.message || String(err),
-      });
-    }
+    console.error(
+      "❌ Erreur create-order LIVE:",
+      err?.response?.data || err.message || err
+    );
+    const status = err?.response?.status || 500;
+    res.status(500).json({ error: "Erreur create-order LIVE", status });
   }
 });
 
-// capture-order : quand le paiement est approuvé
+// capture-order : appelé quand le paiement est approuvé
 app.post("/api/capture-order", async (req, res) => {
   try {
     const { orderID } = req.body || {};
     if (!orderID) {
       return res.status(400).json({ error: "orderID manquant" });
     }
-
-    console.log("➡️ capture-order pour:", orderID);
 
     const accessToken = await getAccessToken();
 
@@ -282,22 +272,12 @@ app.post("/api/capture-order", async (req, res) => {
 
     res.json({ status, pseudo, coins: coinsTotal });
   } catch (err) {
-    console.error("❌ Erreur capture-order LIVE:");
-    if (err.response) {
-      console.error("Status:", err.response.status);
-      console.error("Data:", err.response.data);
-      res.status(500).json({
-        error: "Erreur capture-order LIVE",
-        status: err.response.status,
-        details: err.response.data,
-      });
-    } else {
-      console.error(err.message || err);
-      res.status(500).json({
-        error: "Erreur capture-order LIVE",
-        details: err.message || String(err),
-      });
-    }
+    console.error(
+      "❌ Erreur capture-order LIVE:",
+      err?.response?.data || err.message || err
+    );
+    const status = err?.response?.status || 500;
+    res.status(500).json({ error: "Erreur capture-order LIVE", status });
   }
 });
 
