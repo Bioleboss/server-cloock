@@ -15,8 +15,8 @@ app.use(cors()); // autorise les requêtes depuis ton jeu web
 // CONFIG PAYPAL
 // -----------------------------------------------------------------------------
 // ⚠️ Mets ici tes vraies clés PayPal LIVE
-const PAYPAL_CLIENT_ID = AVLfw6qT49fViHsi5N4_FcFZPJsgoUv000X9GG0dxTb8FXWFTb_BZDsJ7563fNv-KqniwwzplUfr2mC-;
-const PAYPAL_CLIENT_SECRET = EHDWirybXftybUe5--GTL0GlX54myv30Vjz04036Ek4iZHowOUlONYFyxHVwTo654YLS-i0_r7vNyRbt;
+const PAYPAL_CLIENT_ID = "AVLfw6qT49fViHsi5N4_FcFZPJsgoUv000X9GG0dxTb8FXWFTb_BZDsJ7563fNv-KqniwwzplUfr2mC-";
+const PAYPAL_CLIENT_SECRET = "EHDWirybXftybUe5--GTL0GlX54myv30Vjz04036Ek4iZHowOUlONYFyxHVwTo654YLS-i0_r7vNyRbt";
 const PAYPAL_MODE = "live"; // "sandbox" pour test, "live" pour production
 
 const PAYPAL_API_BASE =
