@@ -1,5 +1,5 @@
 // server.js
-// Backend Cloock + PayPal Checkout (create-order + capture-order)
+// Backend Cloock + PayPal Checkout (LIVE ready version)
 
 const express = require("express");
 const fs = require("fs");
@@ -14,10 +14,10 @@ app.use(cors()); // autorise les requêtes depuis ton jeu web
 // -----------------------------------------------------------------------------
 // CONFIG PAYPAL
 // -----------------------------------------------------------------------------
-// ⚠️ REMPLACE ces 2 valeurs par celles de TON appli PayPal (sandbox pour tester)
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_MODE = process.env.PAYPAL_MODE || "sandbox";
+// ⚠️ Mets ici tes vraies clés PayPal LIVE
+const PAYPAL_CLIENT_ID = AVLfw6qT49fViHsi5N4_FcFZPJsgoUv000X9GG0dxTb8FXWFTb_BZDsJ7563fNv-KqniwwzplUfr2mC-;
+const PAYPAL_CLIENT_SECRET = EHDWirybXftybUe5--GTL0GlX54myv30Vjz04036Ek4iZHowOUlONYFyxHVwTo654YLS-i0_r7vNyRbt;
+const PAYPAL_MODE = "live"; // "sandbox" pour test, "live" pour production
 
 const PAYPAL_API_BASE =
   PAYPAL_MODE === "live"
@@ -55,16 +55,14 @@ function saveDb(db) {
 
 function addCoins(pseudo, amount) {
   const db = loadDb();
-  if (!db[pseudo]) {
-    db[pseudo] = { coins: 0 };
-  }
+  if (!db[pseudo]) db[pseudo] = { coins: 0 };
   db[pseudo].coins += amount;
   saveDb(db);
   return db[pseudo].coins;
 }
 
 // -----------------------------------------------------------------------------
-// PayPal helpers
+// PAYPAL HELPER : récupérer un access_token
 // -----------------------------------------------------------------------------
 
 async function getAccessToken() {
@@ -90,7 +88,7 @@ async function getAccessToken() {
 // API
 // -----------------------------------------------------------------------------
 
-// Healthcheck simple
+// Health check
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, mode: PAYPAL_MODE });
 });
@@ -104,9 +102,9 @@ app.get("/api/player/:pseudo", (req, res) => {
 });
 
 /*
-  1) create-order
+  1️⃣ create-order
   Le front envoie le pseudo du joueur.
-  On crée une Order PayPal avec custom_id = pseudo.
+  On crée une commande PayPal avec custom_id = pseudo.
 */
 app.post("/api/create-order", async (req, res) => {
   try {
@@ -125,7 +123,7 @@ app.post("/api/create-order", async (req, res) => {
             currency_code: "EUR",
             value: COINS_PRICE_EUR,
           },
-          custom_id: pseudo, // on stocke le pseudo ici
+          custom_id: pseudo,
         },
       ],
       application_context: {
@@ -146,8 +144,7 @@ app.post("/api/create-order", async (req, res) => {
       }
     );
 
-    const orderId = resp.data.id;
-    res.json({ id: orderId });
+    res.json({ id: resp.data.id });
   } catch (err) {
     console.error("Erreur create-order:", err?.response?.data || err.message);
     res.status(500).json({ error: "Erreur create-order" });
@@ -155,9 +152,9 @@ app.post("/api/create-order", async (req, res) => {
 });
 
 /*
-  2) capture-order
-  Le front envoie orderID après que l'utilisateur ait validé le paiement.
-  On capture, on lit custom_id (pseudo) et on ajoute 6000 pièces.
+  2️⃣ capture-order
+  Appelé par le front après que l'utilisateur ait approuvé le paiement.
+  On capture, on lit custom_id (pseudo), et on crédite 6000 pièces.
 */
 app.post("/api/capture-order", async (req, res) => {
   try {
@@ -181,24 +178,18 @@ app.post("/api/capture-order", async (req, res) => {
 
     const captureData = resp.data;
     const pu = captureData.purchase_units?.[0];
-    const pseudo = pu?.custom_id || null;
+    const pseudo = pu?.custom_id || "Inconnu";
     const status = captureData.status;
     let coinsTotal = null;
 
     if (status === "COMPLETED" && pseudo) {
       coinsTotal = addCoins(pseudo, COINS_PER_PURCHASE);
       console.log(
-        `Paiement OK pour ${pseudo} : +${COINS_PER_PURCHASE} pièces, total = ${coinsTotal}`
+        `✅ Paiement OK pour ${pseudo} : +${COINS_PER_PURCHASE} pièces (total = ${coinsTotal})`
       );
-    } else {
-      console.warn("Capture non complétée ou pseudo manquant:", status, pseudo);
     }
 
-    res.json({
-      status,
-      pseudo,
-      coins: coinsTotal,
-    });
+    res.json({ status, pseudo, coins: coinsTotal });
   } catch (err) {
     console.error("Erreur capture-order:", err?.response?.data || err.message);
     res.status(500).json({ error: "Erreur capture-order" });
@@ -206,10 +197,10 @@ app.post("/api/capture-order", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Lancement du serveur
+// Lancement serveur
 // -----------------------------------------------------------------------------
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Serveur Cloock API en écoute sur http://localhost:${PORT}`);
+  console.log(`🌐 Serveur Cloock API actif sur http://localhost:${PORT}`);
 });
