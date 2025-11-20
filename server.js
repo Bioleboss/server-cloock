@@ -1,5 +1,5 @@
 // server.js
-// Cloock backend : PayPal LIVE + coins + inventaire + HDV + échange en ligne
+// Backend Cloock + PayPal Checkout (LIVE) + HDV multi + synchro coins & skins
 
 const express = require("express");
 const fs = require("fs");
@@ -9,8 +9,11 @@ const cors = require("cors");
 
 const app = express();
 
-// CORS large
-app.use(cors());
+// -----------------------------------------------------------------------------
+// CORS : on OUVRE tout (pour ton index en local ou ailleurs)
+// -----------------------------------------------------------------------------
+app.use(cors()); // autorise tout par défaut
+
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -26,105 +29,163 @@ app.use(express.json());
 // -----------------------------------------------------------------------------
 // CONFIG PAYPAL (LIVE)
 // -----------------------------------------------------------------------------
+// Sur Render :
+// PAYPAL_CLIENT_ID     = ton client-id LIVE
+// PAYPAL_CLIENT_SECRET = ton secret LIVE
+
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+
 const PAYPAL_API_BASE = "https://api-m.paypal.com"; // LIVE
 
-// 1 € = 3000 pièces
-const COINS_PER_EURO = 3000;
+// 3€ => 6000 pièces
+const COINS_PER_PURCHASE = 6000;
+const COINS_PRICE_EUR = "3.00";
 
 // -----------------------------------------------------------------------------
-// "BDD" JSON pour coins + inventaire + historique
+// "BDD" simple JSON pour les joueurs (coins + skins)
 // -----------------------------------------------------------------------------
+// Structure players.json :
+// {
+//   "Pierre": {
+//     "coins": 12345,
+//     "skins": { "basic": 2, "ember": 1 }
+//   },
+//   ...
+// }
+
 const DB_FILE = path.join(__dirname, "players.json");
 
-function loadDb() {
+function loadPlayersDb() {
   try {
     if (!fs.existsSync(DB_FILE)) return {};
     const raw = fs.readFileSync(DB_FILE, "utf8");
     return JSON.parse(raw || "{}");
   } catch (e) {
-    console.error("Erreur lecture DB:", e);
+    console.error("Erreur lecture DB joueurs:", e);
     return {};
   }
 }
 
-function saveDb(db) {
+function savePlayersDb(db) {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
   } catch (e) {
-    console.error("Erreur écriture DB:", e);
+    console.error("Erreur écriture DB joueurs:", e);
   }
+}
+
+// normalise la structure d'un joueur
+function ensurePlayer(db, pseudo) {
+  if (!db[pseudo]) {
+    db[pseudo] = { coins: 0, skins: {} };
+  } else {
+    if (typeof db[pseudo].coins !== "number") db[pseudo].coins = 0;
+    if (!db[pseudo].skins || typeof db[pseudo].skins !== "object") {
+      db[pseudo].skins = {};
+    }
+  }
+  return db[pseudo];
 }
 
 function sanitizePseudo(p) {
   return (p || "Invité").toString().trim().replace(/[|:]/g, "") || "Invité";
 }
 
-function ensurePlayer(db, pseudo) {
-  const name = sanitizePseudo(pseudo);
-  if (!db[name]) {
-    db[name] = {
-      coins: 0,
-      // 1 skin basique par défaut
-      inventory: ["basic"],
-      history: []
-    };
+// Ajoute des pièces à un joueur, retourne le total
+function addCoins(pseudo, amount) {
+  const db = loadPlayersDb();
+  const p = ensurePlayer(db, pseudo);
+  p.coins += amount;
+  if (p.coins < 0) p.coins = 0;
+  savePlayersDb(db);
+  return p.coins;
+}
+
+// Tente de retirer des pièces, renvoie { ok, coins }
+function spendCoins(pseudo, amount) {
+  const db = loadPlayersDb();
+  const p = ensurePlayer(db, pseudo);
+  if (p.coins < amount) {
+    return { ok: false, coins: p.coins };
   }
-  const p = db[name];
-  if (!Array.isArray(p.inventory)) p.inventory = [];
-  if (!Array.isArray(p.history)) p.history = [];
-  if (typeof p.coins !== "number") p.coins = 0;
-  return { player: p, name };
+  p.coins -= amount;
+  if (p.coins < 0) p.coins = 0;
+  savePlayersDb(db);
+  return { ok: true, coins: p.coins };
 }
 
-function addHistoryEntry(player, type, message) {
-  player.history.push({ type, message, ts: Date.now() });
-  if (player.history.length > 200) {
-    player.history.shift();
+// Ajoute des skins (quantité positive)
+function addSkin(pseudo, skinId, qty) {
+  const db = loadPlayersDb();
+  const p = ensurePlayer(db, pseudo);
+  if (!p.skins[skinId]) p.skins[skinId] = 0;
+  p.skins[skinId] += qty;
+  if (p.skins[skinId] < 0) p.skins[skinId] = 0;
+  savePlayersDb(db);
+  return p.skins;
+}
+
+// Retire des skins si possible, renvoie { ok, skins }
+function removeSkin(pseudo, skinId, qty) {
+  const db = loadPlayersDb();
+  const p = ensurePlayer(db, pseudo);
+  const cur = p.skins[skinId] || 0;
+  if (cur < qty) {
+    return { ok: false, skins: p.skins };
   }
-}
-
-function countInventory(player, skinId) {
-  if (!Array.isArray(player.inventory)) return 0;
-  return player.inventory.filter((id) => id === skinId).length;
-}
-
-function removeSkins(player, skinId, qty) {
-  if (!Array.isArray(player.inventory)) player.inventory = [];
-  let remaining = qty;
-  player.inventory = player.inventory.filter((id) => {
-    if (id === skinId && remaining > 0) {
-      remaining--;
-      return false;
-    }
-    return true;
-  });
-}
-
-function addSkins(player, skinId, qty) {
-  if (!Array.isArray(player.inventory)) player.inventory = [];
-  for (let i = 0; i < qty; i++) {
-    player.inventory.push(skinId);
-  }
-}
-
-// coins via PayPal
-function addCoinsToPlayer(db, pseudo, amount, label) {
-  const { player, name } = ensurePlayer(db, pseudo);
-  player.coins = (player.coins || 0) + amount;
-  if (label) {
-    addHistoryEntry(
-      player,
-      "PAYPAL",
-      `${label} : +${amount} pièces (total = ${player.coins})`
-    );
-  }
-  return { totalCoins: player.coins, name };
+  p.skins[skinId] = cur - qty;
+  if (p.skins[skinId] <= 0) delete p.skins[skinId];
+  savePlayersDb(db);
+  return { ok: true, skins: p.skins };
 }
 
 // -----------------------------------------------------------------------------
-// PAYPAL : access_token LIVE
+// BDD simple JSON pour les offres HDV
+// -----------------------------------------------------------------------------
+// Structure auctions.json :
+// [
+//   {
+//     "id": "timestamp_random",
+//     "skinId": "ember",
+//     "skinName": "ember",
+//     "seller": "Pierre",
+//     "quantity": 2,
+//     "price": 500,
+//     "status": "OPEN" | "SOLD" | "CANCELLED",
+//     "createdAt": 123456789,
+//     "buyer": "...?",
+//     "soldAt": 123,
+//     "cancelledAt": 123
+//   },
+//   ...
+// ]
+
+const AUCTION_FILE = path.join(__dirname, "auctions.json");
+
+function loadAuctionsDb() {
+  try {
+    if (!fs.existsSync(AUCTION_FILE)) return [];
+    const raw = fs.readFileSync(AUCTION_FILE, "utf8");
+    const data = JSON.parse(raw || "[]");
+    if (!Array.isArray(data)) return [];
+    return data;
+  } catch (e) {
+    console.error("Erreur lecture DB HDV:", e);
+    return [];
+  }
+}
+
+function saveAuctionsDb(list) {
+  try {
+    fs.writeFileSync(AUCTION_FILE, JSON.stringify(list, null, 2), "utf8");
+  } catch (e) {
+    console.error("Erreur écriture DB HDV:", e);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// PAYPAL : access_token (live)
 // -----------------------------------------------------------------------------
 async function getAccessToken() {
   if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
@@ -142,8 +203,8 @@ async function getAccessToken() {
     {
       headers: {
         Authorization: `Basic ${credentials}`,
-        "Content-Type": "application/x-www-form-urlencoded"
-      }
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
     }
   );
 
@@ -151,322 +212,304 @@ async function getAccessToken() {
 }
 
 // -----------------------------------------------------------------------------
-// HDV : en mémoire (non persistant, c'est OK pour le moment)
-// -----------------------------------------------------------------------------
-let auctionOffers = [];
-
-// -----------------------------------------------------------------------------
-// API
+// API HEALTH
 // -----------------------------------------------------------------------------
 
-// Healthcheck
+// ping pour vérifier le serveur vite fait
 app.get("/api/health", (req, res) => {
+  const auctions = loadAuctionsDb();
   res.json({
     ok: true,
     paypalClient: PAYPAL_CLIENT_ID ? "ok" : "missing",
     mode: "live",
-    hdvOffers: auctionOffers.length
+    hdvOffers: auctions.filter(o => o.status === "OPEN").length,
   });
 });
 
-// Récupérer les infos d'un joueur (debug)
-app.get("/api/player/:pseudo", (req, res) => {
-  const db = loadDb();
-  const { player, name } = ensurePlayer(db, req.params.pseudo);
+// (optionnel) racine simple
+app.get("/", (req, res) => {
+  const auctions = loadAuctionsDb();
   res.json({
-    pseudo: name,
-    coins: player.coins,
-    inventory: player.inventory,
-    history: player.history
+    ok: true,
+    service: "Cloock backend",
+    hdvOffers: auctions.filter(o => o.status === "OPEN").length,
   });
 });
 
-// SYNC global : coins + inventaire + historique
-app.post("/api/sync", (req, res) => {
-  try {
-    const { pseudo } = req.body || {};
-    if (!pseudo) {
-      return res.status(400).json({ ok: false, error: "pseudo manquant" });
-    }
-    const db = loadDb();
-    const { player, name } = ensurePlayer(db, pseudo);
-    res.json({
-      ok: true,
-      player: {
-        pseudo: name,
-        coins: player.coins,
-        inventory: player.inventory || [],
-        history: player.history || []
-      }
-    });
-  } catch (e) {
-    console.error("Erreur /api/sync:", e);
-    res.status(500).json({ ok: false, error: "Erreur interne sync" });
+// -----------------------------------------------------------------------------
+// API JOUEUR : coins + inventaire
+// -----------------------------------------------------------------------------
+
+// récupérer les coins + skins d'un joueur
+app.get("/api/player/:pseudo", (req, res) => {
+  const pseudoRaw = req.params.pseudo;
+  const pseudo = sanitizePseudo(pseudoRaw);
+  const db = loadPlayersDb();
+  const p = db[pseudo] || { coins: 0, skins: {} };
+  res.json({
+    pseudo,
+    coins: p.coins || 0,
+    skins: p.skins || {},
+  });
+});
+
+// ajouter des pièces (par exemple pour les clics)
+app.post("/api/player/add-coins", (req, res) => {
+  const { pseudo: raw, amount, source } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+  const amt = parseInt(amount, 10);
+  if (!pseudo || isNaN(amt) || amt <= 0) {
+    return res.status(400).json({ ok: false, error: "Paramètres invalides" });
   }
+  const total = addCoins(pseudo, amt);
+  console.log(`➕ coins +${amt} pour ${pseudo} (source=${source || "?"}) => total=${total}`);
+  res.json({ ok: true, pseudo, coins: total });
+});
+
+// retirer des pièces (shop, HDV, etc.)
+app.post("/api/player/spend-coins", (req, res) => {
+  const { pseudo: raw, amount, reason } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+  const amt = parseInt(amount, 10);
+  if (!pseudo || isNaN(amt) || amt <= 0) {
+    return res.status(400).json({ ok: false, error: "Paramètres invalides" });
+  }
+  const result = spendCoins(pseudo, amt);
+  if (!result.ok) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pas assez de pièces", coins: result.coins });
+  }
+  console.log(`💸 coins -${amt} pour ${pseudo} (reason=${reason || "?"}) => total=${result.coins}`);
+  res.json({ ok: true, pseudo, coins: result.coins });
+});
+
+// ajouter des skins (cadeaux, rewards)
+app.post("/api/player/add-skin", (req, res) => {
+  const { pseudo: raw, skinId, quantity } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+  const skin = (skinId || "").toString().trim();
+  const qty = parseInt(quantity, 10);
+  if (!pseudo || !skin || isNaN(qty) || qty <= 0) {
+    return res.status(400).json({ ok: false, error: "Paramètres invalides" });
+  }
+  const skins = addSkin(pseudo, skin, qty);
+  console.log(`🎨 +${qty}x ${skin} pour ${pseudo}`);
+  res.json({ ok: true, pseudo, skins });
+});
+
+// retirer des skins (si tu veux synchroniser certains cas)
+app.post("/api/player/remove-skin", (req, res) => {
+  const { pseudo: raw, skinId, quantity } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+  const skin = (skinId || "").toString().trim();
+  const qty = parseInt(quantity, 10);
+  if (!pseudo || !skin || isNaN(qty) || qty <= 0) {
+    return res.status(400).json({ ok: false, error: "Paramètres invalides" });
+  }
+  const result = removeSkin(pseudo, skin, qty);
+  if (!result.ok) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pas assez d'exemplaires de ce skin" });
+  }
+  console.log(`🎨 -${qty}x ${skin} pour ${pseudo}`);
+  res.json({ ok: true, pseudo, skins: result.skins });
 });
 
 // -----------------------------------------------------------------------------
-// ECHANGE EN LIGNE
-// -----------------------------------------------------------------------------
-app.post("/api/exchange/send", (req, res) => {
-  try {
-    let { from, to, skinId, quantity } = req.body || {};
-    if (!from || !to || !skinId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "from, to ou skinId manquant" });
-    }
-    const q = parseInt(quantity, 10) || 0;
-    if (q <= 0) {
-      return res.status(400).json({ ok: false, error: "Quantité invalide" });
-    }
-
-    const db = loadDb();
-    const fromInfo = ensurePlayer(db, from);
-    const toInfo = ensurePlayer(db, to);
-    const fromPlayer = fromInfo.player;
-    const toPlayer = toInfo.player;
-    const fromName = fromInfo.name;
-    const toName = toInfo.name;
-
-    const have = countInventory(fromPlayer, skinId);
-    if (have < q) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Inventaire insuffisant" });
-    }
-
-    removeSkins(fromPlayer, skinId, q);
-    addSkins(toPlayer, skinId, q);
-
-    addHistoryEntry(
-      fromPlayer,
-      "ECHANGE",
-      `Tu envoies ${q}× ${skinId} à ${toName}`
-    );
-    addHistoryEntry(
-      toPlayer,
-      "ECHANGE",
-      `${fromName} t'envoie ${q}× ${skinId}`
-    );
-
-    saveDb(db);
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("Erreur /api/exchange/send:", e);
-    res.status(500).json({ ok: false, error: "Erreur interne échange" });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// HDV : offres
+// API HDV MULTI (synchronisé sur fichiers JSON + joueurs)
 // -----------------------------------------------------------------------------
 
 // Liste des offres ouvertes
 app.get("/api/auction/offers", (req, res) => {
-  const openOffers = auctionOffers
+  const all = loadAuctionsDb();
+  const openOffers = all
     .filter((o) => o.status === "OPEN")
     .map((o) => ({
       id: o.id,
       skinId: o.skinId,
-      skinName: o.skinName,
+      skinName: o.skinName || o.skinId,
       seller: o.seller,
       quantity: o.quantity,
-      price: o.price
+      price: o.price,
     }));
   res.json({ ok: true, offers: openOffers });
 });
 
-// Créer une offre HDV
-app.post("/api/auction/create", (req, res) => {
-  try {
-    const { pseudo, skinId, quantity, price } = req.body || {};
-    if (!pseudo || !skinId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "pseudo ou skinId manquant" });
-    }
-    const qty = parseInt(quantity, 10);
-    const pr = parseInt(price, 10);
-    if (!qty || qty <= 0 || !pr || pr <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Quantité ou prix invalide" });
-    }
+// Créer une offre : vérifie l'inventaire serveur et retire les skins
+app.post("/api/auction/create-offer", (req, res) => {
+  const { pseudo: raw, skinId, quantity, price } = req.body || {};
+  const seller = sanitizePseudo(raw);
+  const skin = (skinId || "").toString().trim();
+  const qty = parseInt(quantity, 10);
+  const pr = parseInt(price, 10);
 
-    const db = loadDb();
-    const { player: seller, name: sellerName } = ensurePlayer(db, pseudo);
-    const have = countInventory(seller, skinId);
-    if (have < qty) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Pas assez de copies de ce skin" });
-    }
-
-    removeSkins(seller, skinId, qty);
-    addHistoryEntry(
-      seller,
-      "HDV",
-      `Mise en vente ${qty}× ${skinId} pour ${pr} pièces`
-    );
-    saveDb(db);
-
-    const id =
-      String(Date.now()) + "_" + Math.random().toString(36).slice(2, 7);
-    const offer = {
-      id,
-      skinId,
-      skinName: skinId,
-      seller: sellerName,
-      quantity: qty,
-      price: pr,
-      status: "OPEN",
-      createdAt: Date.now()
-    };
-    auctionOffers.push(offer);
-
-    res.json({
-      ok: true,
-      offer: {
-        id: offer.id,
-        skinId: offer.skinId,
-        skinName: offer.skinName,
-        seller: offer.seller,
-        quantity: offer.quantity,
-        price: offer.price
-      }
-    });
-  } catch (e) {
-    console.error("Erreur /api/auction/create:", e);
-    res.status(500).json({ ok: false, error: "Erreur interne HDV" });
+  if (!seller || !skin || isNaN(qty) || qty <= 0 || isNaN(pr) || pr <= 0) {
+    return res.status(400).json({ ok: false, error: "Paramètres invalides" });
   }
+
+  // Vérifie inventaire serveur
+  const removeResult = removeSkin(seller, skin, qty);
+  if (!removeResult.ok) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pas assez d'exemplaires de ce skin" });
+  }
+
+  const auctions = loadAuctionsDb();
+  const id =
+    String(Date.now()) + "_" + Math.random().toString(36).slice(2, 7);
+
+  const offer = {
+    id,
+    skinId: skin,
+    skinName: skin,
+    seller,
+    quantity: qty,
+    price: pr,
+    status: "OPEN",
+    createdAt: Date.now(),
+  };
+
+  auctions.push(offer);
+  saveAuctionsDb(auctions);
+
+  console.log(
+    `🏦 Nouvelle offre HDV: ${seller} vend ${qty}x ${skin} pour ${pr} coins (id=${id})`
+  );
+
+  res.json({
+    ok: true,
+    offer: {
+      id: offer.id,
+      skinId: offer.skinId,
+      skinName: offer.skinName,
+      seller: offer.seller,
+      quantity: offer.quantity,
+      price: offer.price,
+    },
+  });
 });
 
-// Acheter une offre HDV
-app.post("/api/auction/buy", (req, res) => {
-  try {
-    const { pseudo, offerId } = req.body || {};
-    if (!pseudo || !offerId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "pseudo ou offerId manquant" });
-    }
+// Acheter une offre : vérifie coins serveur + transfert coins & skins
+app.post("/api/auction/buy-offer", (req, res) => {
+  const { pseudo: raw, offerId } = req.body || {};
+  const buyer = sanitizePseudo(raw);
+  const id = (offerId || "").toString();
 
-    const db = loadDb();
-    const buyerInfo = ensurePlayer(db, pseudo);
-    const buyer = buyerInfo.player;
-    const buyerName = buyerInfo.name;
-
-    const offer = auctionOffers.find((o) => o.id === offerId);
-    if (!offer || offer.status !== "OPEN") {
-      return res
-        .status(404)
-        .json({ ok: false, error: "Offre introuvable ou fermée" });
-    }
-
-    if (offer.seller === buyerName) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Tu ne peux pas acheter ta propre offre" });
-    }
-
-    if ((buyer.coins || 0) < offer.price) {
-      return res.status(400).json({ ok: false, error: "Pas assez de pièces" });
-    }
-
-    const sellerInfo = ensurePlayer(db, offer.seller);
-    const seller = sellerInfo.player;
-    const sellerName = sellerInfo.name;
-
-    buyer.coins -= offer.price;
-    seller.coins = (seller.coins || 0) + offer.price;
-
-    addSkins(buyer, offer.skinId, offer.quantity);
-
-    addHistoryEntry(
-      buyer,
-      "HDV",
-      `Achat ${offer.quantity}× ${offer.skinId} pour ${offer.price} pièces (vendeur: ${sellerName})`
-    );
-    addHistoryEntry(
-      seller,
-      "HDV",
-      `Vente ${offer.quantity}× ${offer.skinId} pour ${offer.price} pièces (acheteur: ${buyerName})`
-    );
-
-    offer.status = "SOLD";
-    offer.buyer = buyerName;
-    offer.soldAt = Date.now();
-
-    saveDb(db);
-
-    res.json({ ok: true, offerId: offer.id });
-  } catch (e) {
-    console.error("Erreur /api/auction/buy:", e);
-    res.status(500).json({ ok: false, error: "Erreur interne HDV" });
+  const auctions = loadAuctionsDb();
+  const idx = auctions.findIndex((o) => o.id === id);
+  if (idx === -1) {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Offre introuvable ou déjà prise" });
   }
+
+  const offer = auctions[idx];
+  if (offer.status !== "OPEN") {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Offre introuvable ou déjà prise" });
+  }
+
+  if (offer.seller === buyer) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Tu ne peux pas acheter ta propre offre" });
+  }
+
+  const price = offer.price;
+  const qty = offer.quantity;
+  const skin = offer.skinId;
+
+  // Vérifie coins côté serveur
+  const spendResult = spendCoins(buyer, price);
+  if (!spendResult.ok) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pas assez de pièces", coins: spendResult.coins });
+  }
+
+  // Crédit vendeur
+  addCoins(offer.seller, price);
+
+  // Donne les skins à l'acheteur
+  const newSkins = addSkin(buyer, skin, qty);
+
+  offer.status = "SOLD";
+  offer.buyer = buyer;
+  offer.soldAt = Date.now();
+  auctions[idx] = offer;
+  saveAuctionsDb(auctions);
+
+  console.log(
+    `🏦 Achat HDV: ${buyer} a acheté ${qty}x ${skin} à ${offer.seller} pour ${price} coins (id=${id})`
+  );
+
+  res.json({
+    ok: true,
+    offerId: offer.id,
+    buyer: buyer,
+    coins: spendResult.coins,
+    skins: newSkins,
+  });
 });
 
-// Annuler une offre HDV
-app.post("/api/auction/cancel", (req, res) => {
-  try {
-    const { pseudo, offerId } = req.body || {};
-    if (!pseudo || !offerId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "pseudo ou offerId manquant" });
-    }
+// Annuler une offre : rend les skins au vendeur
+app.post("/api/auction/cancel-offer", (req, res) => {
+  const { pseudo: raw, offerId } = req.body || {};
+  const seller = sanitizePseudo(raw);
+  const id = (offerId || "").toString();
 
-    const db = loadDb();
-    const { player: seller, name: sellerName } = ensurePlayer(db, pseudo);
-
-    const offer = auctionOffers.find((o) => o.id === offerId);
-    if (!offer || offer.status !== "OPEN") {
-      return res
-        .status(404)
-        .json({ ok: false, error: "Offre introuvable ou fermée" });
-    }
-
-    if (offer.seller !== sellerName) {
-      return res
-        .status(403)
-        .json({ ok: false, error: "Tu ne peux annuler que tes offres" });
-    }
-
-    offer.status = "CANCELLED";
-    offer.cancelledAt = Date.now();
-
-    addSkins(seller, offer.skinId, offer.quantity);
-    addHistoryEntry(
-      seller,
-      "HDV",
-      `Annulation de vente ${offer.quantity}× ${offer.skinId}`
-    );
-
-    saveDb(db);
-
-    res.json({ ok: true, offerId: offer.id });
-  } catch (e) {
-    console.error("Erreur /api/auction/cancel:", e);
-    res.status(500).json({ ok: false, error: "Erreur interne HDV" });
+  const auctions = loadAuctionsDb();
+  const idx = auctions.findIndex((o) => o.id === id);
+  if (idx === -1) {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Offre introuvable ou déjà fermée" });
   }
+
+  const offer = auctions[idx];
+  if (offer.status !== "OPEN") {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Offre introuvable ou déjà fermée" });
+  }
+
+  if (offer.seller !== seller) {
+    return res
+      .status(403)
+      .json({ ok: false, error: "Tu ne peux annuler que tes offres" });
+  }
+
+  // Rendre les skins au vendeur
+  addSkin(seller, offer.skinId, offer.quantity);
+
+  offer.status = "CANCELLED";
+  offer.cancelledAt = Date.now();
+  auctions[idx] = offer;
+  saveAuctionsDb(auctions);
+
+  console.log(
+    `🏦 Offre annulée: ${seller} récupère ${offer.quantity}x ${offer.skinId} (id=${id})`
+  );
+
+  res.json({ ok: true, offerId: offer.id });
 });
 
 // -----------------------------------------------------------------------------
-// PAYPAL : create-order & capture-order (LIVE)
+// PAYPAL : create-order & capture-order (LIVE, comme avant)
 // -----------------------------------------------------------------------------
 
-// create-order : avec montant dynamique
+// create-order : appelé par le bouton PayPal
 app.post("/api/create-order", async (req, res) => {
   try {
-    const { pseudo, amount } = req.body || {};
-    if (!pseudo) {
+    const { pseudo: raw } = req.body || {};
+    const pseudo = sanitizePseudo(raw);
+    if (!pseudo || typeof pseudo !== "string") {
       return res.status(400).json({ error: "pseudo manquant" });
     }
-    let val = parseFloat(amount || "3.00");
-    if (isNaN(val) || val < 1) val = 1;
-    const valueStr = val.toFixed(2);
 
     const accessToken = await getAccessToken();
 
@@ -476,16 +519,16 @@ app.post("/api/create-order", async (req, res) => {
         {
           amount: {
             currency_code: "EUR",
-            value: valueStr
+            value: COINS_PRICE_EUR,
           },
-          custom_id: sanitizePseudo(pseudo)
-        }
+          custom_id: pseudo,
+        },
       ],
       application_context: {
         brand_name: "Cloock",
         shipping_preference: "NO_SHIPPING",
-        user_action: "PAY_NOW"
-      }
+        user_action: "PAY_NOW",
+      },
     };
 
     const resp = await axios.post(
@@ -494,20 +537,13 @@ app.post("/api/create-order", async (req, res) => {
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        }
+          "Content-Type": "application/json",
+        },
       }
     );
 
-    console.log(
-      "✅ create-order LIVE OK:",
-      resp.data.id,
-      "pseudo:",
-      pseudo,
-      "montant:",
-      valueStr
-    );
-    res.json({ id: resp.data.id });
+    console.log("✅ create-order LIVE OK:", resp.data.id, "pseudo:", pseudo);
+    res.json({ id: resp.data.id }); // PayPal attend { id: "..." }
   } catch (err) {
     console.error(
       "❌ Erreur create-order LIVE:",
@@ -517,7 +553,7 @@ app.post("/api/create-order", async (req, res) => {
   }
 });
 
-// capture-order : crédite les pièces en fonction du montant payé
+// capture-order : appelé quand le paiement est approuvé
 app.post("/api/capture-order", async (req, res) => {
   try {
     const { orderID } = req.body || {};
@@ -533,43 +569,27 @@ app.post("/api/capture-order", async (req, res) => {
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        }
+          "Content-Type": "application/json",
+        },
       }
     );
 
     const captureData = resp.data;
-    const status = captureData.status;
     const pu = captureData.purchase_units?.[0];
-    const pseudoFromOrder = pu?.custom_id || "Inconnu";
-    const paidStr = pu?.amount?.value || "0.00";
-    const paidVal = parseFloat(paidStr) || 0;
-    const coinsToAdd = Math.round(paidVal * COINS_PER_EURO);
-
+    const pseudo = sanitizePseudo(pu?.custom_id || "Inconnu");
+    const status = captureData.status;
     let coinsTotal = null;
-    if (status === "COMPLETED" && coinsToAdd > 0) {
-      const db = loadDb();
-      const resCoins = addCoinsToPlayer(
-        db,
-        pseudoFromOrder,
-        coinsToAdd,
-        `Paiement PayPal ${paidVal}€`
-      );
-      coinsTotal = resCoins.totalCoins;
-      saveDb(db);
+
+    if (status === "COMPLETED" && pseudo) {
+      coinsTotal = addCoins(pseudo, COINS_PER_PURCHASE);
       console.log(
-        `✅ Paiement LIVE OK pour ${resCoins.name} : +${coinsToAdd} pièces (total = ${coinsTotal})`
+        `✅ Paiement LIVE OK pour ${pseudo} : +${COINS_PER_PURCHASE} pièces (total = ${coinsTotal})`
       );
     } else {
-      console.warn("⚠️ capture LIVE non complétée ou 0€ payé:", status);
+      console.warn("⚠️ capture LIVE non complétée:", status);
     }
 
-    res.json({
-      status,
-      pseudo: sanitizePseudo(pseudoFromOrder),
-      coins: coinsTotal,
-      coinsAdded: coinsToAdd
-    });
+    res.json({ status, pseudo, coins: coinsTotal });
   } catch (err) {
     console.error(
       "❌ Erreur capture-order LIVE:",
@@ -582,7 +602,7 @@ app.post("/api/capture-order", async (req, res) => {
 // -----------------------------------------------------------------------------
 // Lancement serveur
 // -----------------------------------------------------------------------------
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🌐 Serveur Cloock API LIVE sur port ${PORT}`);
+  console.log(`🌐 Serveur Cloock API LIVE (HDV + PayPal) sur port ${PORT}`);
 });
