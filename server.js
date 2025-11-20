@@ -1,11 +1,12 @@
 // server.js
-// Backend Cloock + PayPal Checkout (LIVE) + HDV multi + synchro coins & skins
+// Backend Cloock + PayPal Checkout (LIVE) + HDV multi + synchro coins & skins + AUTH par mot de passe
 
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const cors = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -43,13 +44,50 @@ const COINS_PER_EURO = 3000;
 const DEFAULT_PRICE_EUR = 3.0;
 
 // -----------------------------------------------------------------------------
-// "BDD" simple JSON pour les joueurs (coins + skins)
+// AUTH : hash + token
+// -----------------------------------------------------------------------------
+const AUTH_SECRET = process.env.CLOOCK_AUTH_SECRET || "change-me-in-prod";
+
+function hashPassword(password) {
+  return crypto.createHash("sha256").update(String(password)).digest("hex");
+}
+
+// Le token est dérivé du pseudo + hash + secret serveur
+function makeAuthToken(pseudo, passwordHash) {
+  return crypto
+    .createHash("sha256")
+    .update(String(pseudo) + ":" + String(passwordHash) + ":" + AUTH_SECRET)
+    .digest("hex");
+}
+
+// Vérifie si un pseudo est protégé et si le token fourni est valide
+// - si le joueur n'a PAS de mot de passe -> ok=true (mode rétrocompatible)
+// - si le joueur a un mot de passe -> require authToken valide
+function checkAuthForPseudo(pseudo, authToken) {
+  const db = loadPlayersDb();
+  const player = db[pseudo];
+
+  if (!player || !player.passwordHash) {
+    // aucun mot de passe pour ce pseudo => on laisse passer (ancien comportement)
+    return { ok: true, hasPassword: false };
+  }
+
+  const expected = makeAuthToken(pseudo, player.passwordHash);
+  if (authToken && authToken === expected) {
+    return { ok: true, hasPassword: true };
+  }
+  return { ok: false, hasPassword: true };
+}
+
+// -----------------------------------------------------------------------------
+// "BDD" simple JSON pour les joueurs (coins + skins + passwordHash)
 // -----------------------------------------------------------------------------
 // Structure players.json :
 // {
 //   "Pierre": {
 //     "coins": 12345,
-//     "skins": { "basic": 2, "ember": 1 }
+//     "skins": { "basic": 2, "ember": 1 },
+//     "passwordHash": "..."           // optionnel
 //   },
 //   ...
 // }
@@ -220,6 +258,131 @@ app.get("/", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// API AUTH : mot de passe + authToken
+// -----------------------------------------------------------------------------
+// NOTE:
+// - /api/auth/register : crée / protège un pseudo avec un mot de passe
+//   -> renvoie { ok, pseudo, authToken }
+// - /api/auth/login : vérifie le mot de passe, renvoie { ok, pseudo, authToken }
+//
+// Le client stocke authToken (localStorage) et l'envoie dans les appels sensibles
+// (spend-coins, remove-skin, HDV, etc.).
+
+// inscription / protection d'un pseudo
+app.post("/api/auth/register", (req, res) => {
+  const { pseudo: raw, password } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+
+  if (!pseudo || pseudo === "Invité") {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pseudo invalide (Invité interdit)." });
+  }
+  if (typeof password !== "string" || password.length < 4) {
+    return res.status(400).json({
+      ok: false,
+      error: "Mot de passe trop court (min 4 caractères).",
+    });
+  }
+
+  const db = loadPlayersDb();
+  const existing = db[pseudo];
+
+  if (existing && existing.passwordHash) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Ce pseudo est déjà protégé par un mot de passe." });
+  }
+
+  const player = ensurePlayer(db, pseudo);
+  player.passwordHash = hashPassword(password);
+  savePlayersDb(db);
+
+  const authToken = makeAuthToken(pseudo, player.passwordHash);
+  console.log(`🔐 Pseudo protégé: ${pseudo}`);
+
+  res.json({ ok: true, pseudo, authToken });
+});
+
+// login sur un pseudo déjà protégé
+app.post("/api/auth/login", (req, res) => {
+  const { pseudo: raw, password } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+
+  if (!pseudo || pseudo === "Invité") {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pseudo invalide (Invité interdit)." });
+  }
+  if (typeof password !== "string" || password.length < 1) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Mot de passe manquant." });
+  }
+
+  const db = loadPlayersDb();
+  const player = db[pseudo];
+  if (!player || !player.passwordHash) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Aucun mot de passe enregistré pour ce pseudo (ou pseudo inconnu).",
+    });
+  }
+
+  const hashed = hashPassword(password);
+  if (hashed !== player.passwordHash) {
+    return res.status(401).json({ ok: false, error: "Mot de passe incorrect." });
+  }
+
+  const authToken = makeAuthToken(pseudo, player.passwordHash);
+  console.log(`✅ Login OK pour ${pseudo}`);
+
+  res.json({ ok: true, pseudo, authToken });
+});
+
+// (optionnel) change password
+app.post("/api/auth/change-password", (req, res) => {
+  const { pseudo: raw, oldPassword, newPassword } = req.body || {};
+  const pseudo = sanitizePseudo(raw);
+
+  if (!pseudo || pseudo === "Invité") {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Pseudo invalide." });
+  }
+  if (typeof newPassword !== "string" || newPassword.length < 4) {
+    return res.status(400).json({
+      ok: false,
+      error: "Nouveau mot de passe trop court (min 4 caractères).",
+    });
+  }
+
+  const db = loadPlayersDb();
+  const player = db[pseudo];
+  if (!player || !player.passwordHash) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Aucun mot de passe enregistré pour ce pseudo (ou pseudo inconnu).",
+    });
+  }
+
+  const oldHash = hashPassword(oldPassword || "");
+  if (oldHash !== player.passwordHash) {
+    return res.status(401).json({ ok: false, error: "Ancien mot de passe incorrect." });
+  }
+
+  player.passwordHash = hashPassword(newPassword);
+  savePlayersDb(db);
+
+  const authToken = makeAuthToken(pseudo, player.passwordHash);
+  console.log(`🔄 Mot de passe modifié pour ${pseudo}`);
+
+  res.json({ ok: true, pseudo, authToken });
+});
+
+// -----------------------------------------------------------------------------
 // API JOUEUR : coins + inventaire
 // -----------------------------------------------------------------------------
 
@@ -237,6 +400,9 @@ app.get("/api/player/:pseudo", (req, res) => {
 });
 
 // ajouter des pièces (par exemple pour les clics)
+// NOTE: on NE demande pas de token ici pour ne pas tout péter :
+// - si le pseudo a un mot de passe, il sera quand même protégé sur la partie "dépense".
+// - add-coins ne peut pas voler, juste "offrir" des pièces.
 app.post("/api/player/add-coins", (req, res) => {
   const { pseudo: raw, amount, source } = req.body || {};
   const pseudo = sanitizePseudo(raw);
@@ -251,14 +417,22 @@ app.post("/api/player/add-coins", (req, res) => {
   res.json({ ok: true, pseudo, coins: total });
 });
 
-// retirer des pièces (shop, HDV, etc.)
+// retirer des pièces (shop, HDV, etc.) -> PROTÉGÉ si mot de passe
 app.post("/api/player/spend-coins", (req, res) => {
-  const { pseudo: raw, amount, reason } = req.body || {};
+  const { pseudo: raw, amount, reason, authToken } = req.body || {};
   const pseudo = sanitizePseudo(raw);
   const amt = parseInt(amount, 10);
   if (!pseudo || isNaN(amt) || amt <= 0) {
     return res.status(400).json({ ok: false, error: "Paramètres invalides" });
   }
+
+  const auth = checkAuthForPseudo(pseudo, authToken);
+  if (!auth.ok && auth.hasPassword) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Authentification requise pour ce pseudo." });
+  }
+
   const result = spendCoins(pseudo, amt);
   if (!result.ok) {
     return res
@@ -273,7 +447,7 @@ app.post("/api/player/spend-coins", (req, res) => {
   res.json({ ok: true, pseudo, coins: result.coins });
 });
 
-// ajouter des skins (cadeaux, rewards)
+// ajouter des skins (cadeaux, rewards, dons...) => non protégé, on peut offrir des skins
 app.post("/api/player/add-skin", (req, res) => {
   const { pseudo: raw, skinId, quantity } = req.body || {};
   const pseudo = sanitizePseudo(raw);
@@ -287,15 +461,23 @@ app.post("/api/player/add-skin", (req, res) => {
   res.json({ ok: true, pseudo, skins });
 });
 
-// retirer des skins (si tu veux synchroniser certains cas)
+// retirer des skins (échanges, HDV, etc.) -> PROTÉGÉ si mot de passe
 app.post("/api/player/remove-skin", (req, res) => {
-  const { pseudo: raw, skinId, quantity } = req.body || {};
+  const { pseudo: raw, skinId, quantity, authToken } = req.body || {};
   const pseudo = sanitizePseudo(raw);
   const skin = (skinId || "").toString().trim();
   const qty = parseInt(quantity, 10);
   if (!pseudo || !skin || isNaN(qty) || qty <= 0) {
     return res.status(400).json({ ok: false, error: "Paramètres invalides" });
   }
+
+  const auth = checkAuthForPseudo(pseudo, authToken);
+  if (!auth.ok && auth.hasPassword) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Authentification requise pour ce pseudo." });
+  }
+
   const result = removeSkin(pseudo, skin, qty);
   if (!result.ok) {
     return res
@@ -327,8 +509,9 @@ app.get("/api/auction/offers", (req, res) => {
 });
 
 // Créer une offre : vérifie l'inventaire serveur et retire les skins
+// -> PROTÉGÉ si mot de passe sur le vendeur
 app.post("/api/auction/create-offer", (req, res) => {
-  const { pseudo: raw, skinId, quantity, price } = req.body || {};
+  const { pseudo: raw, skinId, quantity, price, authToken } = req.body || {};
   const seller = sanitizePseudo(raw);
   const skin = (skinId || "").toString().trim();
   const qty = parseInt(quantity, 10);
@@ -336,6 +519,13 @@ app.post("/api/auction/create-offer", (req, res) => {
 
   if (!seller || !skin || isNaN(qty) || qty <= 0 || isNaN(pr) || pr <= 0) {
     return res.status(400).json({ ok: false, error: "Paramètres invalides" });
+  }
+
+  const auth = checkAuthForPseudo(seller, authToken);
+  if (!auth.ok && auth.hasPassword) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Authentification requise pour ce pseudo." });
   }
 
   // Vérifie inventaire serveur
@@ -382,10 +572,18 @@ app.post("/api/auction/create-offer", (req, res) => {
 });
 
 // Acheter une offre : vérifie coins serveur + transfert coins & skins
+// -> PROTÉGÉ si mot de passe sur l'acheteur
 app.post("/api/auction/buy-offer", (req, res) => {
-  const { pseudo: raw, offerId } = req.body || {};
+  const { pseudo: raw, offerId, authToken } = req.body || {};
   const buyer = sanitizePseudo(raw);
   const id = (offerId || "").toString();
+
+  const auth = checkAuthForPseudo(buyer, authToken);
+  if (!auth.ok && auth.hasPassword) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Authentification requise pour ce pseudo." });
+  }
 
   const auctions = loadAuctionsDb();
   const idx = auctions.findIndex((o) => o.id === id);
@@ -448,10 +646,18 @@ app.post("/api/auction/buy-offer", (req, res) => {
 });
 
 // Annuler une offre : rend les skins au vendeur
+// -> PROTÉGÉ si mot de passe sur le vendeur
 app.post("/api/auction/cancel-offer", (req, res) => {
-  const { pseudo: raw, offerId } = req.body || {};
+  const { pseudo: raw, offerId, authToken } = req.body || {};
   const seller = sanitizePseudo(raw);
   const id = (offerId || "").toString();
+
+  const auth = checkAuthForPseudo(seller, authToken);
+  if (!auth.ok && auth.hasPassword) {
+    return res
+      .status(401)
+      .json({ ok: false, error: "Authentification requise pour ce pseudo." });
+  }
 
   const auctions = loadAuctionsDb();
   const idx = auctions.findIndex((o) => o.id === id);
@@ -623,5 +829,5 @@ app.post("/api/capture-order", async (req, res) => {
 // -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🌐 Serveur Cloock API LIVE (HDV + PayPal) sur port ${PORT}`);
+  console.log(`🌐 Serveur Cloock API LIVE (HDV + PayPal + Auth) sur port ${PORT}`);
 });
