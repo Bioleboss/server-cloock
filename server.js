@@ -38,9 +38,9 @@ const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 
 const PAYPAL_API_BASE = "https://api-m.paypal.com"; // LIVE
 
-// 3€ => 6000 pièces
-const COINS_PER_PURCHASE = 6000;
-const COINS_PRICE_EUR = "3.00";
+// 1€ => 3000 pièces (montant dynamique)
+const COINS_PER_EURO = 3000;
+const DEFAULT_PRICE_EUR = 3.0;
 
 // -----------------------------------------------------------------------------
 // "BDD" simple JSON pour les joueurs (coins + skins)
@@ -143,23 +143,6 @@ function removeSkin(pseudo, skinId, qty) {
 // -----------------------------------------------------------------------------
 // BDD simple JSON pour les offres HDV
 // -----------------------------------------------------------------------------
-// Structure auctions.json :
-// [
-//   {
-//     "id": "timestamp_random",
-//     "skinId": "ember",
-//     "skinName": "ember",
-//     "seller": "Pierre",
-//     "quantity": 2,
-//     "price": 500,
-//     "status": "OPEN" | "SOLD" | "CANCELLED",
-//     "createdAt": 123456789,
-//     "buyer": "...?",
-//     "soldAt": 123,
-//     "cancelledAt": 123
-//   },
-//   ...
-// ]
 
 const AUCTION_FILE = path.join(__dirname, "auctions.json");
 
@@ -222,7 +205,7 @@ app.get("/api/health", (req, res) => {
     ok: true,
     paypalClient: PAYPAL_CLIENT_ID ? "ok" : "missing",
     mode: "live",
-    hdvOffers: auctions.filter(o => o.status === "OPEN").length,
+    hdvOffers: auctions.filter((o) => o.status === "OPEN").length,
   });
 });
 
@@ -232,7 +215,7 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Cloock backend",
-    hdvOffers: auctions.filter(o => o.status === "OPEN").length,
+    hdvOffers: auctions.filter((o) => o.status === "OPEN").length,
   });
 });
 
@@ -262,7 +245,9 @@ app.post("/api/player/add-coins", (req, res) => {
     return res.status(400).json({ ok: false, error: "Paramètres invalides" });
   }
   const total = addCoins(pseudo, amt);
-  console.log(`➕ coins +${amt} pour ${pseudo} (source=${source || "?"}) => total=${total}`);
+  console.log(
+    `➕ coins +${amt} pour ${pseudo} (source=${source || "?"}) => total=${total}`
+  );
   res.json({ ok: true, pseudo, coins: total });
 });
 
@@ -280,7 +265,11 @@ app.post("/api/player/spend-coins", (req, res) => {
       .status(400)
       .json({ ok: false, error: "Pas assez de pièces", coins: result.coins });
   }
-  console.log(`💸 coins -${amt} pour ${pseudo} (reason=${reason || "?"}) => total=${result.coins}`);
+  console.log(
+    `💸 coins -${amt} pour ${pseudo} (reason=${reason || "?"}) => total=${
+      result.coins
+    }`
+  );
   res.json({ ok: true, pseudo, coins: result.coins });
 });
 
@@ -426,9 +415,11 @@ app.post("/api/auction/buy-offer", (req, res) => {
   // Vérifie coins côté serveur
   const spendResult = spendCoins(buyer, price);
   if (!spendResult.ok) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Pas assez de pièces", coins: spendResult.coins });
+    return res.status(400).json({
+      ok: false,
+      error: "Pas assez de pièces",
+      coins: spendResult.coins,
+    });
   }
 
   // Crédit vendeur
@@ -499,17 +490,21 @@ app.post("/api/auction/cancel-offer", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// PAYPAL : create-order & capture-order (LIVE, comme avant)
+// PAYPAL : create-order & capture-order (LIVE, montant dynamique)
 // -----------------------------------------------------------------------------
 
-// create-order : appelé par le bouton PayPal
+// create-order : appelé par le bouton PayPal, avec montant custom
 app.post("/api/create-order", async (req, res) => {
   try {
-    const { pseudo: raw } = req.body || {};
+    const { pseudo: raw, amount } = req.body || {};
     const pseudo = sanitizePseudo(raw);
     if (!pseudo || typeof pseudo !== "string") {
       return res.status(400).json({ error: "pseudo manquant" });
     }
+
+    let val = parseFloat(amount);
+    if (isNaN(val) || val < 1) val = DEFAULT_PRICE_EUR;
+    const valueStr = val.toFixed(2);
 
     const accessToken = await getAccessToken();
 
@@ -519,7 +514,7 @@ app.post("/api/create-order", async (req, res) => {
         {
           amount: {
             currency_code: "EUR",
-            value: COINS_PRICE_EUR,
+            value: valueStr,
           },
           custom_id: pseudo,
         },
@@ -542,7 +537,14 @@ app.post("/api/create-order", async (req, res) => {
       }
     );
 
-    console.log("✅ create-order LIVE OK:", resp.data.id, "pseudo:", pseudo);
+    console.log(
+      "✅ create-order LIVE OK:",
+      resp.data.id,
+      "pseudo:",
+      pseudo,
+      "montant:",
+      valueStr
+    );
     res.json({ id: resp.data.id }); // PayPal attend { id: "..." }
   } catch (err) {
     console.error(
@@ -554,6 +556,7 @@ app.post("/api/create-order", async (req, res) => {
 });
 
 // capture-order : appelé quand le paiement est approuvé
+// => crédite coins = montant payé * COINS_PER_EURO
 app.post("/api/capture-order", async (req, res) => {
   try {
     const { orderID } = req.body || {};
@@ -576,20 +579,36 @@ app.post("/api/capture-order", async (req, res) => {
 
     const captureData = resp.data;
     const pu = captureData.purchase_units?.[0];
+
+    // essaye plusieurs chemins possibles pour retrouver le montant
+    const rawAmount =
+      pu?.amount?.value ||
+      pu?.payments?.captures?.[0]?.amount?.value ||
+      "0.00";
+
+    const paidVal = parseFloat(rawAmount) || 0;
     const pseudo = sanitizePseudo(pu?.custom_id || "Inconnu");
     const status = captureData.status;
-    let coinsTotal = null;
 
-    if (status === "COMPLETED" && pseudo) {
-      coinsTotal = addCoins(pseudo, COINS_PER_PURCHASE);
+    let coinsTotal = null;
+    let coinsAdded = 0;
+
+    if (status === "COMPLETED" && pseudo && paidVal > 0) {
+      coinsAdded = Math.round(paidVal * COINS_PER_EURO);
+      coinsTotal = addCoins(pseudo, coinsAdded);
       console.log(
-        `✅ Paiement LIVE OK pour ${pseudo} : +${COINS_PER_PURCHASE} pièces (total = ${coinsTotal})`
+        `✅ Paiement LIVE OK pour ${pseudo} : ${paidVal}€ => +${coinsAdded} pièces (total = ${coinsTotal})`
       );
     } else {
-      console.warn("⚠️ capture LIVE non complétée:", status);
+      console.warn(
+        "⚠️ capture LIVE non complétée ou montant nul:",
+        status,
+        "montant=",
+        paidVal
+      );
     }
 
-    res.json({ status, pseudo, coins: coinsTotal });
+    res.json({ status, pseudo, coins: coinsTotal, coinsAdded });
   } catch (err) {
     console.error(
       "❌ Erreur capture-order LIVE:",
